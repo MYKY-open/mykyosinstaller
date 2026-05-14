@@ -4,11 +4,11 @@ TIMEZONE="Europe/Prague"
 LOCALE="en_US.UTF-8"
 KEYMAP="cz-qwertz"
 SWAPPINESS="100"
-KERNEL_PARAMS="mem_sleep_default=deep nowatchdog irqaffinity=0-2 preempt=lazy transparent_hugepage=always rcu_nocbs=all rcutree.enable_rcu_lazy=1 rcupdate.rcu_expedited=1"
+KERNEL_PARAMS="mem_sleep_default=deep nowatchdog threadirqs irqaffinity=0-1 preempt=lazy transparent_hugepage=always tsc=reliable clocksource=tsc audit=0 mce=off rcutree.enable_rcu_lazy=1 rcutree.rcu_normal_wake_from_gp=0"
 INSTALL_POINT="/archinstaller"
 BTRFS_MOUNT_OPTIONS="autodefrag,noatime,compress=zstd:3,space_cache=v2,ssd,discard=async,clear_cache"
 BCACHEFS_MOUNT_OPTIONS="compression=none,background_compression=zstd:7,journal_flush_delay=1000,fsync_delay=1000"
-F2FS_MOUNT_OPTIONS="defaults,noatime,lazytime,discard,flush_merge,mode=adaptive,compress_algorithm=zstd:1,compress_cache"
+F2FS_MOUNT_OPTIONS="defaults,noatime,lazytime,discard,flush_merge,inline_xattr,inline_data,inline_dentry,mode=adaptive,compress_algorithm=zstd:6,compress_cache"
 F2FS_FORMAT_FEATURES="extra_attr,inode_checksum,sb_checksum,compression"
 EXT4_MOUNT_OPTIONS="noatime,commit=60,barrier=0"
 
@@ -121,7 +121,7 @@ case $filesystem_choice in
 esac
 
 if [[ "$filesystem" == "f2fs" ]]; then
-    KERNEL_PARAMS="$KERNEL_PARAMS rootflags=atgc,gc_merge,noatime,compress_algorithm=zstd:1,compress_cache"
+    KERNEL_PARAMS="$KERNEL_PARAMS rootflags=atgc,gc_merge,noatime,compress_algorithm=zstd:6,compress_cache"
 fi
 
 if [[ "$filesystem" == "ext4" ]]; then
