@@ -223,8 +223,12 @@ install_base_system() {
 
 chroot_into_system() {
     # Generate fstab
-    print_step "Generating fstab..."
-    genfstab -U $INSTALL_POINT >> $INSTALL_POINT/etc/fstab
+    if [[ "$INSTALL_MODE" != "archive" ]]; then
+        print_step "Generating fstab..."
+        genfstab -U $INSTALL_POINT >> $INSTALL_POINT/etc/fstab
+    else
+        print_step "Skipping fstab generation for archive mode..."
+    fi
 
     # Chroot into the new system and execute commands
     print_step "Chrooting into the new system at $INSTALL_POINT..."
@@ -317,6 +321,12 @@ vm.vfs_cache_pressure = 50
 vm.dirty_background_ratio = 5
 vm.dirty_ratio = 10
 kernel.split_lock_mitigate=0
+
+# Optimization: Reduce VM statistic update frequency
+vm.stat_interval = 60
+
+# Optimization: Restrict perf event monitoring
+kernel.perf_event_paranoid = 3
 
 # Network improvements
 net.core.rmem_max = 16777216
@@ -592,3 +602,19 @@ install_grub_bios() {
 EOF
 }
 
+create_rootfs_archive() {
+    print_step "Creating rootfs archive at $archive_output_path..."
+    # Ensure the parent directory for the output path exists
+    mkdir -p "$(dirname "$archive_output_path")"
+    
+    # Compress the INSTALL_POINT into the target archive
+    # Support common extensions: tar.gz, tar.zst, tar.xz
+    if [[ "$archive_output_path" == *.tar.zst ]]; then
+        tar --numeric-owner -I 'zstd -T0' -cpf "$archive_output_path" -C "$INSTALL_POINT" .
+    elif [[ "$archive_output_path" == *.tar.xz ]]; then
+        tar --numeric-owner -I 'xz -T0' -cpf "$archive_output_path" -C "$INSTALL_POINT" .
+    else
+        # Default to gzip
+        tar --numeric-owner -czpf "$archive_output_path" -C "$INSTALL_POINT" .
+    fi
+}
