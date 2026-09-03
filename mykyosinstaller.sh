@@ -1,13 +1,14 @@
 #!/bin/bash
-TCP_CONGESTION_CONTROL=nv
+TCP_CONGESTION_CONTROL=bic
 TIMEZONE="Europe/Prague"
 LOCALE="en_US.UTF-8"
 KEYMAP="cz-qwertz"
 SWAPPINESS="100"
-KERNEL_PARAMS="mem_sleep_default=deep nowatchdog threadirqs irqaffinity=all preempt=lazy transparent_hugepage=madvise split_lock_detect=off zswap.shrinker_enabled=0 tsc=reliable clocksource=tsc audit=0 rcu_nocbs=all rcutree.enable_rcu_lazy=1 rcutree.rcu_normal_wake_from_gp=0 rcutree.use_softirq=0"
+KERNEL_PARAMS="zswap.shrinker_enabled=0 mem_sleep_default=deep transparent_hugepage=madvise split_lock_detect=off nowatchdog tsc=reliable clocksource=tsc audit=0 preempt=lazy rcutree.rcu_normal_wake_from_gp=1 mitigations=off random.trust_cpu=on iommu=off"
 INSTALL_POINT="/archinstaller"
-BTRFS_MOUNT_OPTIONS="autodefrag,noatime,compress=zstd:3,space_cache=v2,ssd,discard=async,clear_cache"
-BCACHEFS_MOUNT_OPTIONS="compression=none,background_compression=zstd:7,journal_flush_delay=1000,fsync_delay=1000"
+BTRFS_MOUNT_OPTIONS="autodefrag,noatime,compress=zstd:3,space_cache=v2,ssd,discard=async"
+BTRFS_MOUNT_OPTIONS_HDD="autodefrag,noatime,compress=zstd:3,space_cache=v2"
+
 F2FS_MOUNT_OPTIONS="defaults,noatime,lazytime,discard,flush_merge,inline_xattr,inline_data,inline_dentry,mode=adaptive,compress_algorithm=zstd:6,compress_cache"
 F2FS_FORMAT_FEATURES="extra_attr,inode_checksum,sb_checksum,compression"
 EXT4_MOUNT_OPTIONS="noatime,commit=60,barrier=0"
@@ -124,7 +125,6 @@ if [[ "$INSTALL_MODE" != "archive" ]]; then
     echo "1. ext4 (the universal, recommended)"
     echo "2. btrfs (terminator, cant kill)"
     echo "3. f2fs (flash memory optimized, recommended)"
-    echo "4. bcachefs (will be removed soon)"
     read -p "Enter the number of your chosen filesystem: " filesystem_choice
 
     # Determine the filesystem based on user choice
@@ -132,12 +132,22 @@ if [[ "$INSTALL_MODE" != "archive" ]]; then
       1) filesystem="ext4" ;;
       2) filesystem="btrfs" ;;
       3) filesystem="f2fs" ;;
-      4) filesystem="bcachefs" ;;
       *)
         echo "Invalid filesystem choice. Defaulting to ext4."
         filesystem="ext4"
         ;;
     esac
+
+    if [[ "$filesystem" == "btrfs" ]]; then
+        echo ""
+        echo "Is the target disk an HDD or SSD?"
+        echo "1. SSD / NVMe (enables ssd mode, async discard)"
+        echo "2. HDD        (no ssd mode, no discard, autodefrag)"
+        read -p "Enter your choice (1 or 2): " btrfs_disk_type
+        if [[ "$btrfs_disk_type" == "2" ]]; then
+            BTRFS_MOUNT_OPTIONS="$BTRFS_MOUNT_OPTIONS_HDD"
+        fi
+    fi
 
     if [[ "$filesystem" == "f2fs" ]]; then
         KERNEL_PARAMS="$KERNEL_PARAMS rootflags=atgc,gc_merge,noatime,compress_algorithm=zstd:6,compress_cache"
@@ -157,6 +167,13 @@ if [[ "$INSTALL_MODE" != "archive" ]]; then
     read -p "Enter your choice (1 or 2): " encryption_choice
 fi
 
+# Zram Selection
+echo ""
+echo "Enable zram swap? (compressed RAM-backed swap, good for low-RAM systems)"
+echo "1. No"
+echo "2. Yes"
+read -p "Enter your choice (1 or 2): " zram_choice
+
 # Determine encryption status
 case $format_choice in
   1) format_boot_partition="no" ;;
@@ -174,6 +191,16 @@ case $encryption_choice in
   *)
     echo "Invalid choice. Defaulting to no encryption."
     encryption="no"
+    ;;
+esac
+
+# Determine zram status
+case $zram_choice in
+  1) enable_zram="no" ;;
+  2) enable_zram="yes" ;;
+  *)
+    echo "Invalid choice. Defaulting to no zram."
+    enable_zram="no"
     ;;
 esac
 
@@ -271,6 +298,9 @@ fi
 install_base_system
 chroot_into_system
 install_configs
+if [[ "$enable_zram" == "yes" ]]; then
+    configure_zram
+fi
 
 if [[ "$INSTALL_MODE" != "archive" ]]; then
     if [ "$bootloader" = "grub" ]; then

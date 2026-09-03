@@ -60,9 +60,7 @@ mount_home() {
         btrfs)
             opts=$BTRFS_MOUNT_OPTIONS
             ;;
-        bcachefs)
-            opts=$BCACHEFS_MOUNT_OPTIONS
-            ;;
+
         f2fs)
             opts=$F2FS_MOUNT_OPTIONS
             ;;
@@ -124,10 +122,7 @@ format_partitions() {
             print_step "Formatting root partition $root_device as f2fs with options $F2FS_FORMAT_FEATURES..."
             mkfs.f2fs -f -O "$F2FS_FORMAT_FEATURES" "$root_device"
             ;;
-        "bcachefs")
-            print_step "Formatting root partition $root_device as bcachefs..."
-            mkfs.bcachefs -f "$root_device"
-            ;;
+
         *)
             echo "Invalid filesystem choice. Defaulting to ext4."
             mkfs.ext4 "$root_device"
@@ -151,9 +146,7 @@ mount_partitions() {
         "f2fs")
             mount -o $F2FS_MOUNT_OPTIONS $root_device $INSTALL_POINT
             ;;
-        "bcachefs")
-            mount -o $BCACHEFS_MOUNT_OPTIONS $root_device $INSTALL_POINT
-            ;;
+
         *)
             mount -o $EXT4_MOUNT_OPTIONS $root_device $INSTALL_POINT
             ;;
@@ -173,7 +166,7 @@ install_base_system() {
     fi
 
     # Base packages including the chosen kernel and base-devel
-    base_packages="base base-devel dhcpcd $kernel_package power-profiles-daemon pacman nano git sudo linux-firmware efibootmgr networkmanager bluez bluez-utils htop fastfetch wireplumber git mkinitcpio reflector zsh zsh-theme-powerlevel10k cachyos-rate-mirrors $mesa_pkg"
+    base_packages="base base-devel dhcpcd $kernel_package power-profiles-daemon pacman nano git sudo linux-firmware wireless-regdb efibootmgr networkmanager bluez bluez-utils htop fastfetch wireplumber git mkinitcpio reflector zsh zsh-theme-powerlevel10k cachyos-rate-mirrors $mesa_pkg"
 
     # Additional packages based on the chosen filesystem
     case $filesystem in
@@ -183,9 +176,7 @@ install_base_system() {
         "f2fs")
             base_packages="$base_packages f2fs-tools"
             ;;
-        "bcachefs")
-            base_packages="$base_packages bcachefs-tools"
-            ;;
+
     esac
 
     # Desktop environment packages
@@ -262,9 +253,7 @@ if [ "$encryption" = yes ]; then
     if [ "$filesystem" = "btrfs" ]; then
         sed -i 's/^HOOKS=.*/HOOKS=(base systemd keyboard keymap modconf block sd-encrypt btrfs filesystems fsck autodetect microcode)/' /etc/mkinitcpio.conf
         sed -i 's/^MODULES=.*/MODULES=(btrfs)/' /etc/mkinitcpio.conf
-    elif [ "$filesystem" = "bcachefs" ]; then
-        sed -i 's/^HOOKS=.*/HOOKS=(base systemd keyboard keymap modconf block sd-encrypt filesystems fsck autodetect microcode)/' /etc/mkinitcpio.conf
-        sed -i 's/^MODULES=.*/MODULES=(bcachefs)/' /etc/mkinitcpio.conf
+
     elif [ "$filesystem" = "f2fs" ]; then
         sed -i 's/^HOOKS=.*/HOOKS=(base systemd keyboard keymap modconf block sd-encrypt filesystems fsck autodetect microcode)/' /etc/mkinitcpio.conf
         sed -i 's/^MODULES=.*/MODULES=(f2fs)/' /etc/mkinitcpio.conf
@@ -276,9 +265,7 @@ else
     if [ "$filesystem" = "btrfs" ]; then
         sed -i 's/^HOOKS=.*/HOOKS=(base systemd keyboard keymap modconf block btrfs filesystems fsck autodetect microcode)/' /etc/mkinitcpio.conf
         sed -i 's/^MODULES=.*/MODULES=(btrfs)/' /etc/mkinitcpio.conf
-    elif [ "$filesystem" = "bcachefs" ]; then
-        sed -i 's/^HOOKS=.*/HOOKS=(base systemd keyboard keymap modconf block filesystems fsck autodetect microcode)/' /etc/mkinitcpio.conf
-        sed -i 's/^MODULES=.*/MODULES=(bcachefs)/' /etc/mkinitcpio.conf
+
     elif [ "$filesystem" = "f2fs" ]; then
         sed -i 's/^HOOKS=.*/HOOKS=(base systemd keyboard keymap modconf block filesystems fsck autodetect microcode)/' /etc/mkinitcpio.conf
         sed -i 's/^MODULES=.*/MODULES=(f2fs)/' /etc/mkinitcpio.conf
@@ -329,8 +316,11 @@ vm.stat_interval = 60
 kernel.perf_event_paranoid = 3
 
 # Network improvements
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 1048576 33554432
+net.ipv4.tcp_wmem = 4096 1048576 33554432
+net.core.optmem_max = 65536
 net.ipv4.tcp_congestion_control = $TCP_CONGESTION_CONTROL
 net.core.default_qdisc = cake
 net.ipv4.tcp_slow_start_after_idle = 0
@@ -348,6 +338,11 @@ kernel.sched_cfs_bandwidth_slice_us = 50000
 fs.file-max = 2097152
 fs.inotify.max_user_watches = 524288
 SYSCTL
+
+# TCP Algorithm Deep Tuning (Final Boss Settings)
+print_step "Applying TCP module deep tuning..."
+mkdir -p /etc/modprobe.d
+echo "options tcp_bic fast_convergence=0 beta=700 max_increment=64" > /etc/modprobe.d/tcp_bic.conf
 
 # Set up zsh for the user
 print_step "Setting up user environment..."
@@ -399,6 +394,14 @@ export LESS_TERMCAP_ue=$'\e[0m'
 export LESS_TERMCAP_us=$'\e[1;4;31m'
 ZSHRC
 
+# Give user.slice higher CPU and IO weight so userspace beats kernel/system tasks
+mkdir -p /etc/systemd/system/user.slice.d
+cat > /etc/systemd/system/user.slice.d/99-resources.conf <<EOL
+[Slice]
+CPUWeight=800
+IOWeight=800
+EOL
+
 # Fix ownership of user home directory and files
 echo "Fixing ownership of user home directory..."
 chown -R $username:$username /home/$username
@@ -419,35 +422,58 @@ systemctl mask systemd-coredump.socket
 EOF
 }
 
+configure_zram() {
+    print_step "Enabling zram swap..."
+    mkdir -p "$INSTALL_POINT/usr/lib/systemd"
+    cat > "$INSTALL_POINT/usr/lib/systemd/zram-generator.conf" <<EOL
+[zram0]
+compression-algorithm = zstd
+zram-size = ram
+swap-priority = 100
+fs-type = swap
+EOL
+}
+
 sysdboot() {
-arch-chroot $INSTALL_POINT /bin/bash <<EOF
+    # Pre-resolve identifiers based on encryption (matching GRUB pattern)
+    local luks_uuid=""
+    local root_partuuid=""
+    if [ "$encryption" = "yes" ]; then
+        luks_uuid=$(blkid -s UUID -o value "$root_partition")
+        if [ -z "$luks_uuid" ]; then
+            echo "Error: could not determine UUID of LUKS container $root_partition"
+            return 1
+        fi
+    else
+        root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
+        if [ -z "$root_partuuid" ]; then
+            echo "Error: could not determine PARTUUID of $root_device"
+            return 1
+        fi
+    fi
+    arch-chroot "$INSTALL_POINT" /bin/bash <<EOF
 # Bootloader
 print_step "Installing bootloader..."
 bootctl install
 
 # Create boot entry
 mkdir -p /boot/loader/entries
-KERNEL_NAME=\$(echo $kernel_package | sed 's/linux-//')
-if [ "$encryption" = yes ]; then
-    # For encrypted systems, use UUID of the LUKS container
-    LUKS_UUID=\$(blkid -s UUID -o value "$root_partition")
+if [ "$encryption" = "yes" ]; then
+    LUKS_UUID="$luks_uuid"
     cat << EOL > /boot/loader/entries/arch.conf
-title   Arch Linux ($kernel_package)
+title   MYKYcorp ($kernel_package)
 linux   /vmlinuz-$kernel_package
 initrd  /initramfs-$kernel_package.img
 options rd.luks.uuid=\$LUKS_UUID rd.luks.name=\$LUKS_UUID=$CRYPTROOT_NAME root=/dev/mapper/$CRYPTROOT_NAME rw $KERNEL_PARAMS
 EOL
-
 else
-    # For unencrypted systems, use PARTUUID
-    ROOT_PARTUUID=\$(blkid -s PARTUUID -o value "$root_device")
+    ROOT_PARTUUID="$root_partuuid"
     cat << EOL > /boot/loader/entries/arch.conf
 title   MYKYcorp ($kernel_package)
 linux   /vmlinuz-$kernel_package
 initrd  /initramfs-$kernel_package.img
 options root=PARTUUID=\$ROOT_PARTUUID rw $KERNEL_PARAMS
 EOL
-
 fi
 
 cat > /boot/loader/loader.conf <<EOL
