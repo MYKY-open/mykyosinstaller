@@ -20,6 +20,28 @@ install_configs() {
         echo "Warning: CachyOS-Settings directory not found, skipping system configs"
     fi
 
+    # Ensure systemd-resolved Quad9 DoT configuration exists
+    if [[ ! -f "$INSTALL_POINT/usr/lib/systemd/resolved.conf.d/10-quad9.conf" && ! -f "$INSTALL_POINT/etc/systemd/resolved.conf.d/10-quad9.conf" ]]; then
+        mkdir -p "$INSTALL_POINT/etc/systemd/resolved.conf.d"
+        cat > "$INSTALL_POINT/etc/systemd/resolved.conf.d/10-quad9.conf" <<'QUAD9_EOF'
+[Resolve]
+DNS=9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net 2620:fe::fe#dns.quad9.net 2620:fe::9#dns.quad9.net
+FallbackDNS=149.112.112.112#dns.quad9.net 2620:fe::9#dns.quad9.net 9.9.9.9#dns.quad9.net 2620:fe::fe#dns.quad9.net
+DNSOverTLS=yes
+Domains=~.
+QUAD9_EOF
+    fi
+
+    # Ensure NetworkManager delegates DNS to systemd-resolved
+    if [[ ! -f "$INSTALL_POINT/usr/lib/NetworkManager/conf.d/dns.conf" && ! -f "$INSTALL_POINT/etc/NetworkManager/conf.d/dns.conf" ]]; then
+        mkdir -p "$INSTALL_POINT/etc/NetworkManager/conf.d"
+        cat > "$INSTALL_POINT/etc/NetworkManager/conf.d/dns.conf" <<'NM_DNS_EOF'
+[main]
+dns=systemd-resolved
+NM_DNS_EOF
+    fi
+
+
     # Copy user-specific configurations
     if [[ -d "./home" ]]; then
         print_step "Installing user configurations for $username..."
@@ -293,11 +315,15 @@ echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
 # Enable services
 print_step "Enabling services..."
 systemctl enable NetworkManager
+systemctl enable systemd-resolved
 systemctl enable fstrim.timer
 systemctl enable reflector.timer
 systemctl enable power-profiles-daemon.service
-systemctl enable dhcpcd
 systemctl enable sddm
+# Ensure dhcpcd and systemd-networkd do not clash with NetworkManager
+systemctl disable dhcpcd 2>/dev/null || true
+systemctl disable systemd-networkd 2>/dev/null || true
+systemctl disable iwd 2>/dev/null || true
 
 # Performance tuning
 print_step "Applying performance tweaks..."
@@ -420,6 +446,8 @@ chmod 644 /etc/pacman.conf
 systemctl mask systemd-coredump.service
 systemctl mask systemd-coredump.socket
 EOF
+    # Set up resolv.conf symlink on target filesystem outside the chroot (avoids arch-chroot bind-mount collision)
+    ln -sf /run/systemd/resolve/stub-resolv.conf "$INSTALL_POINT/etc/resolv.conf"
 }
 
 configure_zram() {

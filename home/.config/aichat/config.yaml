@@ -1,9 +1,0 @@
-# see https://github.com/sigoden/aichat/blob/main/config.example.yaml
-
-model: mymklocal:/mdst/Qwen3-30B-A3B-Q4_K_M.gguf
-clients:
-- type: openai-compatible
-  name: mymklocal
-  api_base: http://127.0.0.1:8080/v1
-  models:
-  - name: /mdst/Qwen3-30B-A3B-Q4_K_M.gguf
