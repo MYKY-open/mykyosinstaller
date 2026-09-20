@@ -207,7 +207,9 @@ install_base_system() {
             base_packages="$base_packages sddm gnome $adpackages"
             ;;
         "kde")
-            base_packages="$base_packages sddm xorg wayland plasma sddm konsole dolphin ark $adpackages"
+            # plasma-meta = full desktop (spectacle, widgets, wayland session) minus
+            # group cruft: plasma-bigscreen/nano/sdk. X11 stack dropped.
+            base_packages="$base_packages sddm wayland plasma-meta konsole dolphin ark $adpackages"
             ;;
         "xfce")
             base_packages="$base_packages sddm xfce4 $adpackages"
