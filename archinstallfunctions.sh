@@ -481,8 +481,11 @@ EOL
 # setup locales and console keymap
 echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
 
-# Uncomment the locale dynamically using the variable
-sed -i "s/^#$LOCALE UTF-8/$LOCALE UTF-8/" /etc/locale.gen
+# Enable installer LOCALE plus cs_CZ (Plasma skeleton plasma-localerc forces
+# LANG=cs_CZ.UTF-8, so it must exist or every setlocale() warns/fails)
+sed -i -E "s/^#($LOCALE|cs_CZ\.UTF-8)( +UTF-8)/\1\2/" /etc/locale.gen
+grep -q "^$LOCALE" /etc/locale.gen || echo "$LOCALE UTF-8" >> /etc/locale.gen
+grep -q '^cs_CZ.UTF-8' /etc/locale.gen || echo 'cs_CZ.UTF-8 UTF-8' >> /etc/locale.gen
 
 # Generate it
 locale-gen
