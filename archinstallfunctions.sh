@@ -56,128 +56,335 @@ NM_DNS_EOF
     fi
 }
 
-mount_home() {
-    # Only proceed if home_partition is defined
-    if [[ -z "$home_partition" ]]; then
-        echo "Skipping home mount: \$home_partition is not set."
+# ---------------------------------------------------------------------------
+# Generic multi-partition support.
+# MOUNTS entries are "device|mountpoint|fstype|format(yes/no)|enc(yes/no)"
+# and are built by the TUI disk planner in mykyosinstaller.sh.
+# fstype "inherit" marks a BIND mount: same filesystem as the device's primary
+# assignment, mounted at an additional mountpoint via mount --bind.
+# enc "yes" = LUKS2 container. Root is unlocked by initramfs (rd.luks.uuid),
+# everything else by systemd crypttab with a keyfile stored on encrypted root.
+# ---------------------------------------------------------------------------
+
+prepare_partition() {
+    local part="$1"
+    # Unmount any stale mounts held on this partition (live env automount, leftovers)
+    if findmnt -rn -S "$part" >/dev/null 2>&1; then
+        echo "Warning: $part has stale mount(s), unmounting..."
+        findmnt -rn -S "$part" -o TARGET -n | while read -r m; do
+            umount -R "$m" 2>/dev/null || umount -l "$m"
+        done
+    fi
+    # Wipe old filesystem signatures so kernel/blkid can't mistake the old fs for the valid one
+    wipefs -af "$part"
+    sync
+}
+
+# Deterministic mapper name for a mountpoint: /mnt/data -> crypt-mnt-data
+crypt_name() {
+    local n="${1#/}"
+    echo "crypt-${n//\//-}"
+}
+
+# RAID sets: entries are "name|level|dev1 dev2 ..." (built by the planner).
+# A MOUNTS entry references an array with device field "md:<name>".
+real_dev() {
+    if [[ "$1" == md:* ]]; then
+        echo "/dev/md/${1#md:}"
+    else
+        echo "$1"
+    fi
+}
+
+create_raid_arrays() {
+    local set name level members node d
+    [[ ${#RAIDSETS[@]} -gt 0 ]] || return 0
+    for set in "${RAIDSETS[@]}"; do
+        IFS='|' read -r name level members <<<"$set"
+        local -a devs
+        read -ra devs <<<"$members"
+        node="/dev/md/$name"
+        if [[ -e "$node" ]]; then
+            echo "RAID array $node already exists, reusing it."
+            continue
+        fi
+        print_step "Creating RAID$level array $node (${#devs[@]} disks: ${devs[*]})..."
+        # stale md superblocks would block assembly
+        for d in "${devs[@]}"; do
+            wipefs -af "$d" >/dev/null 2>&1 || true
+        done
+        mdadm --create "$node" --level="$level" --raid-devices="${#devs[@]}" --run "${devs[@]}"
+    done
+    udevadm settle
+}
+
+# First regular (non-bind, non-swap) mountpoint of a device
+primary_of() {
+    local want="$1" spec d m f
+    for spec in "${MOUNTS[@]}"; do
+        IFS='|' read -r d m f _ _ <<<"$spec"
+        if [[ "$d" == "$want" && "$f" != "inherit" && "$m" != "swap" ]]; then
+            echo "$m"
+            return 0
+        fi
+    done
+    return 1
+}
+
+mount_opts_for() {
+    local fs="$1"
+    case "$fs" in
+        btrfs) echo "$BTRFS_MOUNT_OPTIONS" ;;
+        f2fs)  echo "$F2FS_MOUNT_OPTIONS" ;;
+        ext4)  echo "$EXT4_MOUNT_OPTIONS" ;;
+        *)     echo "" ;;
+    esac
+}
+
+format_all() {
+    local spec dev mnt fs fmt enc
+    create_raid_arrays
+    for spec in "${MOUNTS[@]}"; do
+        IFS='|' read -r dev mnt fs fmt enc <<<"$spec"
+        if [[ "$fs" == "inherit" ]]; then
+            echo "$dev bind-> $mnt shares the primary filesystem, nothing to format."
+            continue
+        fi
+        if [[ "$fmt" != "yes" ]]; then
+            echo "Skipping format of $dev ($mnt) as requested."
+            continue
+        fi
+        dev=$(real_dev "$dev")
+        prepare_partition "$dev"
+        if [[ "$mnt" == "/" ]]; then
+            root_partition="$dev"
+            if [[ "$enc" == "yes" ]]; then
+                print_step "Encrypting root partition $dev with LUKS..."
+                cryptsetup luksFormat "$dev"
+                cryptsetup open "$dev" "$CRYPTROOT_NAME"
+                root_device="/dev/mapper/$CRYPTROOT_NAME"
+                dev="$root_device"
+            else
+                root_device="$dev"
+            fi
+        elif [[ "$enc" == "yes" ]]; then
+            # Secondary LUKS container: unlocked at boot via crypttab + keyfile.
+            # Keyfile goes to a temp stash - INSTALL_POINT is not the mounted
+            # root partition yet, generate_fstab moves it into the target later.
+            local cname keyfile
+            cname=$(crypt_name "$mnt")
+            [[ -n "${KEYFILE_DIR:-}" ]] || KEYFILE_DIR=$(mktemp -d)
+            keyfile="$KEYFILE_DIR/$cname.key"
+            print_step "Encrypting $dev ($mnt) with LUKS as /dev/mapper/$cname..."
+            cryptsetup luksFormat "$dev"
+            cryptsetup open "$dev" "$cname"
+            dd if=/dev/urandom of="$keyfile" bs=512 count=8
+            chmod 600 "$keyfile"
+            # luksAddKey prompts for the passphrase just given at luksFormat
+            cryptsetup luksAddKey "$dev" "$keyfile"
+            dev="/dev/mapper/$cname"
+        fi
+        case "$fs" in
+            ext4)
+                print_step "Formatting $dev ($mnt) as ext4..."
+                mkfs.ext4 -F "$dev"
+                ;;
+            btrfs)
+                print_step "Formatting $dev ($mnt) as btrfs..."
+                mkfs.btrfs -f "$dev"
+                ;;
+            f2fs)
+                print_step "Formatting $dev ($mnt) as f2fs..."
+                mkfs.f2fs -f -O "$F2FS_FORMAT_FEATURES" "$dev"
+                ;;
+            vfat)
+                print_step "Formatting $dev ($mnt) as FAT32..."
+                mkfs.fat -F32 "$dev"
+                ;;
+            swap)
+                print_step "Setting up swap on $dev..."
+                mkswap -L mykyswap "$dev"
+                ;;
+            *)
+                echo "Error: unknown filesystem '$fs' for $dev, skipping format."
+                ;;
+        esac
+    done
+    # Make sure all format writes hit the disk and udev re-scanned before mount
+    sync
+    udevadm settle
+}
+
+mount_one() {
+    local dev="$1" mnt="$2" fs="$3"
+    local target="$INSTALL_POINT$mnt"
+    mkdir -p "$target"
+    if [[ "$fs" == "inherit" ]]; then
+        # Bind mount of a SUBDIRECTORY of the device's primary (container) mountpoint.
+        # Subdir name = mountpoint path without leading slash: /var -> var,
+        # /srv/docker -> srv/docker. Keeps each target's content isolated on the
+        # shared filesystem instead of aliasing the whole fs root.
+        local primary src_dir
+        primary=$(primary_of "$dev") || {
+            echo "Error: $dev bind-> $mnt has no primary assignment."
+            return 1
+        }
+        src_dir="$INSTALL_POINT$primary/${mnt#/}"
+        mkdir -p "$src_dir"
+        print_step "Bind mounting $src_dir to $target..."
+        mount --bind "$src_dir" "$target"
+        if mountpoint -q "$target"; then
+            echo "$src_dir bound successfully on $target."
+        else
+            echo "Error: failed to bind $src_dir on $target"
+            return 1
+        fi
         return 0
     fi
-
-    # Define target mount point
-    local target="$INSTALL_POINT/home"
-
-    print_step "Mounting home partition $home_partition to $target..."
-    mkdir -p "$target"
-
-    # Detect filesystem type
-    local fstype
-    fstype=$(blkid -s TYPE -o value "$home_partition") || {
-        echo "Error: could not detect filesystem type of $home_partition"
-        return 1
-    }
-
-    # Choose mount options based on fs type
+    dev=$(real_dev "$dev")
     local opts
-    case "$fstype" in
-        btrfs)
-            opts=$BTRFS_MOUNT_OPTIONS
-            ;;
-
-        f2fs)
-            opts=$F2FS_MOUNT_OPTIONS
-            ;;
-        ext4)
-            opts=$EXT4_MOUNT_OPTIONS
-            ;;
-        *)
-            echo "Warning: unknown fs type '$fstype' – mounting without extra options."
-            opts=""
-            ;;
-    esac
-
-    # Perform the mount
+    opts=$(mount_opts_for "$fs")
+    print_step "Mounting $dev to $target${opts:+ ($opts)}..."
     if [[ -n "$opts" ]]; then
-        mount -o "$opts" "$home_partition" "$target"
+        mount -o "$opts" "$dev" "$target"
     else
-        mount "$home_partition" "$target"
+        mount "$dev" "$target"
     fi
-
-    # Check mount success
     if mountpoint -q "$target"; then
-        echo "Home partition mounted successfully."
+        echo "$dev mounted successfully on $target."
     else
-        echo "Error: failed to mount $home_partition on $target"
+        echo "Error: failed to mount $dev on $target"
         return 1
     fi
 }
 
-format_partitions() {
-    # Optionally format the boot partition based on variable
-    if [[ "$format_boot_partition" == "yes" ]]; then
-        print_step "Formatting boot partition $boot_partition as FAT32..."
-        mkfs.fat -F32 "$boot_partition"
-    else
-        echo "Skipping formatting of $boot_partition."
+# fstab generator. genfstab cannot reliably express subdir bind mounts, so we
+# write fstab ourselves from the planner plan: UUID lines for regular
+# partitions and swaps, path-based "none bind" lines for bind mounts.
+generate_fstab() {
+    print_step "Generating fstab..."
+    local spec dev mnt fs fmt enc uuid opts pass primary src cname
+    local -a crypttab=()
+    mkdir -p "$INSTALL_POINT/etc"
+    # Keyfiles were stashed in a temp dir during format_all (root partition was
+    # not mounted at INSTALL_POINT yet back then); move them into the target now
+    if [[ -n "${KEYFILE_DIR:-}" && -n "$(ls -A "$KEYFILE_DIR" 2>/dev/null)" ]]; then
+        mkdir -p "$INSTALL_POINT/etc/cryptsetup-keys.d"
+        cp -a "$KEYFILE_DIR"/. "$INSTALL_POINT/etc/cryptsetup-keys.d/"
+        chmod 600 "$INSTALL_POINT/etc/cryptsetup-keys.d/"*.key
     fi
+    : > "$INSTALL_POINT/etc/fstab"
 
-    # Handle root partition formatting based on encryption setting
-    if [[ "$encryption" == "yes" ]]; then
-        print_step "Encrypting root partition $root_partition with LUKS..."
-        cryptsetup luksFormat "$root_partition"
-        cryptsetup open "$root_partition" "$CRYPTROOT_NAME"
-        root_device="/dev/mapper/$CRYPTROOT_NAME"
-    else
-        root_device="$root_partition"
+    local -a ordered
+    # Safe order: root, regular mounts by depth, binds by depth, swaps
+    mapfile -t ordered < <(printf '%s\n' "${MOUNTS[@]}" | awk -F'|' '
+        $2 == "/"       { print "0 0", $0; next }
+        $2 == "swap"    { print "3 0", $0; next }
+        $3 == "inherit" { print "2", split($2, a, "/") - 1, $0; next }
+        { print "1", split($2, a, "/") - 1, $0 }' \
+        | sort -k1,1 -k2,2n | cut -d' ' -f3-)
+
+    for spec in "${ordered[@]}"; do
+        IFS='|' read -r dev mnt fs fmt enc <<<"$spec"
+        if [[ "$fs" == "inherit" ]]; then
+            primary=$(primary_of "$dev") || {
+                echo "Error: no primary assignment for bind $mnt of $dev"
+                return 1
+            }
+            # Bind source is a system path at boot: <primary>/<subdir>
+            echo "$primary/${mnt#/}  $mnt  none  bind  0  0" >> "$INSTALL_POINT/etc/fstab"
+            continue
+        fi
+        local src
+        if [[ "$fs" == "swap" ]]; then
+            uuid=$(blkid -s UUID -o value "$dev")
+            echo "UUID=$uuid  none  swap  sw  0  0" >> "$INSTALL_POINT/etc/fstab"
+            continue
+        fi
+        if [[ "$mnt" == "/" && "$enc" == "yes" ]]; then
+            # fs UUID lives on the OPENED mapper, not on the raw LUKS container
+            uuid=$(blkid -s UUID -o value "/dev/mapper/$CRYPTROOT_NAME")
+            src="UUID=$uuid"
+        elif [[ "$enc" == "yes" ]]; then
+            cname=$(crypt_name "$mnt")
+            src="/dev/mapper/$cname"
+            crypttab+=("$cname  UUID=$(blkid -s UUID -o value "$(real_dev "$dev")")  /etc/cryptsetup-keys.d/$cname.key  luks,discard")
+        else
+            uuid=$(blkid -s UUID -o value "$(real_dev "$dev")")
+            if [[ -z "$uuid" ]]; then
+                echo "Error: could not read UUID of $dev, fstab incomplete."
+                return 1
+            fi
+            src="UUID=$uuid"
+        fi
+        opts=$(mount_opts_for "$fs")
+        [[ -n "$opts" ]] && opts="$opts,"
+        pass=0
+        if [[ "$mnt" == "/" ]]; then
+            pass=1
+        else
+            case "$fs" in ext4|f2fs) pass=2 ;; esac
+        fi
+        echo "$src  $mnt  $fs  ${opts}defaults  0  $pass" >> "$INSTALL_POINT/etc/fstab"
+    done
+    if [[ ${#crypttab[@]} -gt 0 ]]; then
+        {
+            echo "# <name>  <LUKS UUID>  <keyfile>  <options>"
+            printf '%s\n' "${crypttab[@]}"
+        } > "$INSTALL_POINT/etc/crypttab"
+        echo "crypttab written:"
+        cat "$INSTALL_POINT/etc/crypttab"
     fi
-
-    # Format root partition based on selected filesystem
-    case "$filesystem" in
-        "ext4")
-            print_step "Formatting root partition $root_device as ext4..."
-            mkfs.ext4 "$root_device"
-            ;;
-        "btrfs")
-            print_step "Formatting root partition $root_device as btrfs..."
-            mkfs.btrfs -f "$root_device"
-            ;;
-        "f2fs")
-            print_step "Formatting root partition $root_device as f2fs with options $F2FS_FORMAT_FEATURES..."
-            mkfs.f2fs -f -O "$F2FS_FORMAT_FEATURES" "$root_device"
-            ;;
-
-        *)
-            echo "Invalid filesystem choice. Defaulting to ext4."
-            mkfs.ext4 "$root_device"
-            ;;
-    esac
+    if [[ ${#RAIDSETS[@]} -gt 0 ]]; then
+        # udev rules of the mdadm package auto-assemble arrays listed here
+        print_step "Writing mdadm.conf..."
+        mdadm --detail --scan >> "$INSTALL_POINT/etc/mdadm.conf"
+        cat "$INSTALL_POINT/etc/mdadm.conf"
+    fi
+    echo "fstab written:"
+    cat "$INSTALL_POINT/etc/fstab"
 }
 
+mount_all() {
+    local spec dev mnt fs fmt
+    mkdir -p "$INSTALL_POINT"
 
-mount_partitions() {
-    # Mount the root partition
-    bootmountpoint=${bootmountpoint:-/boot}
-    print_step "Mounting root partition $root_device to $INSTALL_POINT..."
-    mkdir -p $INSTALL_POINT
-    case $filesystem in
-        "ext4")
-            mount -o $EXT4_MOUNT_OPTIONS $root_device $INSTALL_POINT
-            ;;
-        "btrfs")
-            mount -o $BTRFS_MOUNT_OPTIONS $root_device $INSTALL_POINT
-            ;;
-        "f2fs")
-            mount -o $F2FS_MOUNT_OPTIONS $root_device $INSTALL_POINT
-            ;;
+    # Root first, everything else after it in mountpoint-depth order
+    for spec in "${MOUNTS[@]}"; do
+        IFS='|' read -r dev mnt fs fmt enc <<<"$spec"
+        [[ "$mnt" == "/" ]] || continue
+        mount_one "$root_device" "/" "$fs" || return 1
+    done
 
-        *)
-            mount -o $EXT4_MOUNT_OPTIONS $root_device $INSTALL_POINT
-            ;;
-    esac
+    local -a _parts _binds
+    mapfile -t _parts < <(printf '%s\n' "${MOUNTS[@]}" \
+        | awk -F'|' '$2 != "/" && $2 != "swap" && $3 != "inherit" { print split($2, a, "/") - 1, $0 }' \
+        | sort -n | cut -d' ' -f2-)
+    # Bind mounts come last: their primary mountpoint must be mounted first
+    mapfile -t _binds < <(printf '%s\n' "${MOUNTS[@]}" \
+        | awk -F'|' '$3 == "inherit" { print split($2, a, "/") - 1, $0 }' \
+        | sort -n | cut -d' ' -f2-)
 
-    # Mount the boot partition
-    print_step "Mounting boot partition $boot_partition to $INSTALL_POINT$bootmountpoint..."
-    mkdir -p $INSTALL_POINT$bootmountpoint
-    mount $boot_partition $INSTALL_POINT$bootmountpoint
+    local _spec
+    for _spec in "${_parts[@]}"; do
+        IFS='|' read -r dev mnt fs fmt enc <<<"$_spec"
+        mount_one "$dev" "$mnt" "$fs" || return 1
+    done
+    for _spec in "${_binds[@]}"; do
+        IFS='|' read -r dev mnt fs fmt enc <<<"$_spec"
+        mount_one "$dev" "$mnt" "$fs" || return 1
+    done
+
+    # Activate swap partitions
+    for spec in "${MOUNTS[@]}"; do
+        IFS='|' read -r dev mnt fs fmt enc <<<"$spec"
+        [[ "$mnt" == "swap" ]] || continue
+        if swapon "$dev" 2>/dev/null; then
+            echo "Swap on $dev activated."
+        else
+            echo "Warning: could not activate swap on $dev (missing swap signature? choose format=yes)."
+        fi
+    done
 }
 
 install_base_system() {
@@ -190,16 +397,29 @@ install_base_system() {
     # Base packages including the chosen kernel and base-devel
     base_packages="base base-devel dhcpcd $kernel_package power-profiles-daemon pacman nano git sudo linux-firmware wireless-regdb efibootmgr networkmanager bluez bluez-utils htop fastfetch wireplumber git mkinitcpio reflector zsh zsh-theme-powerlevel10k cachyos-rate-mirrors $mesa_pkg"
 
-    # Additional packages based on the chosen filesystem
-    case $filesystem in
-        "btrfs")
-            base_packages="$base_packages btrfs-progs"
-            ;;
-        "f2fs")
-            base_packages="$base_packages f2fs-tools"
-            ;;
-
-    esac
+    # Filesystem tools needed by ANY assigned partition (root or otherwise)
+    local spec fs enc
+    if [[ -n "${MOUNTS[*]:-}" ]]; then
+        for spec in "${MOUNTS[@]}"; do
+            fs=$(cut -d'|' -f3 <<<"$spec")
+            enc=$(cut -d'|' -f5 <<<"$spec")
+            case $fs in
+                btrfs) base_packages="$base_packages btrfs-progs" ;;
+                f2fs)  base_packages="$base_packages f2fs-tools" ;;
+            esac
+            if [[ "$enc" == "yes" || "$encryption" == "yes" ]]; then
+                base_packages="$base_packages cryptsetup"
+            fi
+        done
+        if [[ ${#RAIDSETS[@]} -gt 0 ]]; then
+            base_packages="$base_packages mdadm"
+        fi
+    else
+        case $filesystem in
+            "btrfs") base_packages="$base_packages btrfs-progs" ;;
+            "f2fs")  base_packages="$base_packages f2fs-tools" ;;
+        esac
+    fi
 
     # Desktop environment packages
     case $desktop_environment in
@@ -239,8 +459,7 @@ install_base_system() {
 chroot_into_system() {
     # Generate fstab
     if [[ "$INSTALL_MODE" != "archive" ]]; then
-        print_step "Generating fstab..."
-        genfstab -U $INSTALL_POINT >> $INSTALL_POINT/etc/fstab
+        generate_fstab
     else
         print_step "Skipping fstab generation for archive mode..."
     fi
@@ -297,6 +516,11 @@ else
         sed -i 's/^HOOKS=.*/HOOKS=(base systemd keyboard keymap modconf block filesystems fsck autodetect microcode)/' /etc/mkinitcpio.conf
         sed -i 's/^MODULES=.*/MODULES=(ext4)/' /etc/mkinitcpio.conf
     fi
+fi
+# Root on mdadm array: assemble the array in the initramfs before root mount
+# (mdadm.conf is written before chroot, the mdadm_udev hook embeds it)
+if [[ "$root_partition" == /dev/md/* ]]; then
+    sed -i 's/modconf block /modconf block mdadm_udev /' /etc/mkinitcpio.conf
 fi
 mkinitcpio -P
 
@@ -468,6 +692,8 @@ sysdboot() {
     # Pre-resolve identifiers based on encryption (matching GRUB pattern)
     local luks_uuid=""
     local root_partuuid=""
+    local root_uuid=""
+    local ROOT_PARAM=""
     if [ "$encryption" = "yes" ]; then
         luks_uuid=$(blkid -s UUID -o value "$root_partition")
         if [ -z "$luks_uuid" ]; then
@@ -475,10 +701,21 @@ sysdboot() {
             return 1
         fi
     else
-        root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
-        if [ -z "$root_partuuid" ]; then
-            echo "Error: could not determine PARTUUID of $root_device"
-            return 1
+        if [[ "$root_partition" == /dev/md/* ]]; then
+            # md arrays have no PARTUUID - use the filesystem UUID
+            root_uuid=$(blkid -s UUID -o value "$root_device")
+            if [ -z "$root_uuid" ]; then
+                echo "Error: could not determine UUID of $root_device"
+                return 1
+            fi
+            ROOT_PARAM="root=UUID=$root_uuid"
+        else
+            root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
+            if [ -z "$root_partuuid" ]; then
+                echo "Error: could not determine PARTUUID of $root_device"
+                return 1
+            fi
+            ROOT_PARAM="root=PARTUUID=$root_partuuid"
         fi
     fi
     arch-chroot "$INSTALL_POINT" /bin/bash <<EOF
@@ -497,12 +734,11 @@ initrd  /initramfs-$kernel_package.img
 options rd.luks.uuid=\$LUKS_UUID rd.luks.name=\$LUKS_UUID=$CRYPTROOT_NAME root=/dev/mapper/$CRYPTROOT_NAME rw $KERNEL_PARAMS
 EOL
 else
-    ROOT_PARTUUID="$root_partuuid"
     cat << EOL > /boot/loader/entries/arch.conf
 title   MYKYcorp ($kernel_package)
 linux   /vmlinuz-$kernel_package
 initrd  /initramfs-$kernel_package.img
-options root=PARTUUID=\$ROOT_PARTUUID rw $KERNEL_PARAMS
+options $ROOT_PARAM rw $KERNEL_PARAMS
 EOL
 fi
 
@@ -519,6 +755,8 @@ install_grub() {
     # Pre‑resolve identifiers based on encryption
     local luks_uuid=""
     local root_partuuid=""
+    local root_uuid=""
+    local ROOT_PARAM=""
     if [ "$encryption" = "yes" ]; then
         luks_uuid=$(blkid -s UUID -o value "$root_partition")
         if [ -z "$luks_uuid" ]; then
@@ -526,10 +764,21 @@ install_grub() {
             return 1
         fi
     else
-        root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
-        if [ -z "$root_partuuid" ]; then
-            echo "Error: could not determine PARTUUID of $root_device"
-            return 1
+        if [[ "$root_partition" == /dev/md/* ]]; then
+            # md arrays have no PARTUUID - use the filesystem UUID
+            root_uuid=$(blkid -s UUID -o value "$root_device")
+            if [ -z "$root_uuid" ]; then
+                echo "Error: could not determine UUID of $root_device"
+                return 1
+            fi
+            ROOT_PARAM="root=UUID=$root_uuid"
+        else
+            root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
+            if [ -z "$root_partuuid" ]; then
+                echo "Error: could not determine PARTUUID of $root_device"
+                return 1
+            fi
+            ROOT_PARAM="root=PARTUUID=$root_partuuid"
         fi
     fi
     arch-chroot "$INSTALL_POINT" /bin/bash <<EOF
@@ -543,9 +792,8 @@ install_grub() {
         # Add cryptodisk modules to preload
         sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos luks cryptodisk"|' /etc/default/grub
     else
-        # For unencrypted systems, use PARTUUID
-        ROOT_PARTUUID="$root_partuuid"
-        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"root=PARTUUID=\$ROOT_PARTUUID ${KERNEL_PARAMS}\"|" /etc/default/grub
+        # For unencrypted systems: PARTUUID, or UUID for md arrays (no PARTUUID)
+        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"${ROOT_PARAM} ${KERNEL_PARAMS}\"|" /etc/default/grub
     fi
     sed -i 's|^#GRUB_TIMEOUT=[0-9]\+|GRUB_TIMEOUT=3|' /etc/default/grub
     sed -i 's|^#GRUB_DISABLE_OS_PROBER=false|GRUB_DISABLE_OS_PROBER=false|' /etc/default/grub
@@ -564,6 +812,8 @@ install_grubcursed() {
     # For devices with 32-bit UEFI but 64-bit CPU
     local luks_uuid=""
     local root_partuuid=""
+    local root_uuid=""
+    local ROOT_PARAM=""
     if [ "$encryption" = "yes" ]; then
         luks_uuid=$(blkid -s UUID -o value "$root_partition")
         if [ -z "$luks_uuid" ]; then
@@ -571,10 +821,21 @@ install_grubcursed() {
             return 1
         fi
     else
-        root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
-        if [ -z "$root_partuuid" ]; then
-            echo "Error: could not determine PARTUUID of $root_device"
-            return 1
+        if [[ "$root_partition" == /dev/md/* ]]; then
+            # md arrays have no PARTUUID - use the filesystem UUID
+            root_uuid=$(blkid -s UUID -o value "$root_device")
+            if [ -z "$root_uuid" ]; then
+                echo "Error: could not determine UUID of $root_device"
+                return 1
+            fi
+            ROOT_PARAM="root=UUID=$root_uuid"
+        else
+            root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
+            if [ -z "$root_partuuid" ]; then
+                echo "Error: could not determine PARTUUID of $root_device"
+                return 1
+            fi
+            ROOT_PARAM="root=PARTUUID=$root_partuuid"
         fi
     fi
     arch-chroot "$INSTALL_POINT" /bin/bash <<EOF
@@ -588,9 +849,8 @@ install_grubcursed() {
         # Add cryptodisk modules to preload
         sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos luks cryptodisk"|' /etc/default/grub
     else
-        # For unencrypted systems, use PARTUUID
-        ROOT_PARTUUID="$root_partuuid"
-        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"root=PARTUUID=\$ROOT_PARTUUID ${KERNEL_PARAMS}\"|" /etc/default/grub
+        # For unencrypted systems: PARTUUID, or UUID for md arrays (no PARTUUID)
+        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"${ROOT_PARAM} ${KERNEL_PARAMS}\"|" /etc/default/grub
     fi
     sed -i 's|^#GRUB_TIMEOUT=[0-9]\+|GRUB_TIMEOUT=3|' /etc/default/grub
     sed -i 's|^#GRUB_DISABLE_OS_PROBER=false|GRUB_DISABLE_OS_PROBER=false|' /etc/default/grub
@@ -609,6 +869,8 @@ install_grub_bios() {
     # Pre-resolve identifiers and disk device
     local luks_uuid=""
     local root_partuuid=""
+    local root_uuid=""
+    local ROOT_PARAM=""
     local disk=""
     if [ "$encryption" = "yes" ]; then
         luks_uuid=$(blkid -s UUID -o value "$root_partition")
@@ -617,14 +879,41 @@ install_grub_bios() {
             return 1
         fi
     else
-        root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
-        if [ -z "$root_partuuid" ]; then
-            echo "Error: could not determine PARTUUID of $root_device"
-            return 1
+        if [[ "$root_partition" == /dev/md/* ]]; then
+            # md arrays have no PARTUUID - use the filesystem UUID
+            root_uuid=$(blkid -s UUID -o value "$root_device")
+            if [ -z "$root_uuid" ]; then
+                echo "Error: could not determine UUID of $root_device"
+                return 1
+            fi
+            ROOT_PARAM="root=UUID=$root_uuid"
+        else
+            root_partuuid=$(blkid -s PARTUUID -o value "$root_device")
+            if [ -z "$root_partuuid" ]; then
+                echo "Error: could not determine PARTUUID of $root_device"
+                return 1
+            fi
+            ROOT_PARAM="root=PARTUUID=$root_partuuid"
         fi
     fi
-    # Strip partition number to get disk (e.g. /dev/sda2 -> /dev/sda)
-    disk=$(echo "$root_partition" | sed 's/[0-9]*$//')
+    if [[ "$root_partition" == /dev/md/* ]]; then
+        # BIOS boot on md: install to every member disk of the array
+        local mdname="${root_partition#/dev/md/}" set
+        disk=""
+        for set in "${RAIDSETS[@]}"; do
+            if [[ "$(cut -d'|' -f1 <<<"$set")" == "$mdname" ]]; then
+                disk=$(cut -d'|' -f3 <<<"$set")
+            fi
+        done
+        if [ -z "$disk" ]; then
+            echo "Error: could not find members of $root_partition in RAIDSETS"
+            return 1
+        fi
+    else
+        # Resolve the parent disk properly (works for /dev/sda2 and /dev/nvme0n1p1)
+        disk=$(lsblk -nro PKNAME "$root_partition" | head -n1)
+        disk="/dev/$disk"
+    fi
     arch-chroot "$INSTALL_POINT" /bin/bash <<EOF
     # Install GRUB and required packages
     print_step "Installing GRUB bootloader for BIOS system..."
@@ -639,20 +928,21 @@ install_grub_bios() {
         # Add cryptodisk modules to preload
         sed -i 's|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES="part_gpt part_msdos luks cryptodisk"|' /etc/default/grub
     else
-        # For unencrypted systems, use PARTUUID
-        ROOT_PARTUUID="$root_partuuid"
-        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"root=PARTUUID=\$ROOT_PARTUUID ${KERNEL_PARAMS}\"|" /etc/default/grub
+        # For unencrypted systems: PARTUUID, or UUID for md arrays (no PARTUUID)
+        sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"${ROOT_PARAM} ${KERNEL_PARAMS}\"|" /etc/default/grub
     fi
     # Theme and timing tweaks
     sed -i 's|^#GRUB_TIMEOUT=[0-9]\+|GRUB_TIMEOUT=3|' /etc/default/grub
     sed -i 's|^#GRUB_DISABLE_OS_PROBER=false|GRUB_DISABLE_OS_PROBER=false|' /etc/default/grub
     sed -i 's|^GRUB_TIMEOUT_STYLE=hidden|#GRUB_TIMEOUT_STYLE=hidden|' /etc/default/grub
-    # Install GRUB to MBR
-    grub-install \
-      --target=i386-pc \
-      --recheck \
-      --boot-directory=/boot \
-      ${disk}
+    # Install GRUB to MBR (loop handles multi-disk md arrays)
+    for d in ${disk}; do
+        grub-install \
+          --target=i386-pc \
+          --recheck \
+          --boot-directory=/boot \
+          ${d}
+    done
     # Generate GRUB configuration
     grub-mkconfig -o /boot/grub/grub.cfg
 EOF
