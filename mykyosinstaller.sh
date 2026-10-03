@@ -595,10 +595,10 @@ enable_zram="$MENU_RESULT"
 
 if [[ "$INSTALL_MODE" == "partitions" ]]; then
     ui_menu "Bootloader" "Choose a bootloader:" \
-        "systemd-boot" "systemd-boot (simpler, faster)" \
-        "grub" "GRUB efi (more features, supports multiple OSes)" \
-        "grub32bitefi" "GRUB efi 32bit (cursed 32bit EFI with 64bit CPU, intel atom netbooks)" \
-        "grub-bios" "GRUB bios (more features, supports multiple OSes)" \
+        "systemd-boot" "systemd-boot (simple, fast)" \
+        "grub" "GRUB EFI (multi-OS)" \
+        "grub32bitefi" "GRUB 32-bit EFI (Atom netbooks)" \
+        "grub-bios" "GRUB BIOS (multi-OS)" \
         || die "Installation cancelled."
     bootloader="$MENU_RESULT"
 
