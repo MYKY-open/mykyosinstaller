@@ -1,5 +1,5 @@
 #!/bin/bash
-TCP_CONGESTION_CONTROL=bic
+TCP_CONGESTION_CONTROL=bbr3
 TIMEZONE="Europe/Prague"
 LOCALE="en_US.UTF-8"
 KEYMAP="cz-qwertz"

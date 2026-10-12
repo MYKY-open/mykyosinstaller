@@ -395,7 +395,7 @@ install_base_system() {
     fi
 
     # Base packages including the chosen kernel and base-devel
-    base_packages="base base-devel dhcpcd $kernel_package power-profiles-daemon pacman nano git sudo linux-firmware wireless-regdb efibootmgr networkmanager bluez bluez-utils htop fastfetch wireplumber git mkinitcpio reflector zsh zsh-theme-powerlevel10k cachyos-rate-mirrors $mesa_pkg"
+    base_packages="base base-devel dhcpcd $kernel_package power-profiles-daemon pacman nano git sudo linux-firmware wireless-regdb efibootmgr networkmanager bluez bluez-utils htop fastfetch wireplumber git mkinitcpio zsh zsh-theme-powerlevel10k cachyos-rate-mirrors $mesa_pkg"
 
     # Filesystem tools needed by ANY assigned partition (root or otherwise)
     local spec fs enc
@@ -546,9 +546,14 @@ print_step "Enabling services..."
 systemctl enable NetworkManager
 systemctl enable systemd-resolved
 systemctl enable fstrim.timer
-systemctl enable reflector.timer
+systemctl enable cachyos-rate-mirrors.timer
 systemctl enable power-profiles-daemon.service
 systemctl enable sddm
+# Duplicate mirror ranker: reflector.timer + cachyos-rate-mirrors.timer do same job, keep CachyOS native only
+systemctl disable reflector.timer 2>/dev/null || true
+# NetworkManager-wait-online stalls boot ~8s, only needed for NFS-at-boot, off by default
+systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
 # Ensure dhcpcd and systemd-networkd do not clash with NetworkManager
 systemctl disable dhcpcd 2>/dev/null || true
 systemctl disable systemd-networkd 2>/dev/null || true
@@ -577,7 +582,7 @@ net.ipv4.tcp_rmem = 4096 1048576 33554432
 net.ipv4.tcp_wmem = 4096 1048576 33554432
 net.core.optmem_max = 65536
 net.ipv4.tcp_congestion_control = $TCP_CONGESTION_CONTROL
-net.core.default_qdisc = cake
+net.core.default_qdisc = fq
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_notsent_lowat = 16384
@@ -594,10 +599,13 @@ fs.file-max = 2097152
 fs.inotify.max_user_watches = 524288
 SYSCTL
 
-# TCP Algorithm Deep Tuning (Final Boss Settings)
-print_step "Applying TCP module deep tuning..."
-mkdir -p /etc/modprobe.d
-echo "options tcp_bic fast_convergence=0 beta=700 max_increment=64" > /etc/modprobe.d/tcp_bic.conf
+# BBRv3: tcp_bbr (v1) and tcp_bbr3 conflict, keep v3 only
+print_step "Setting up BBRv3..."
+mkdir -p /etc/modprobe.d /etc/modules-load.d
+rm -f /etc/modprobe.d/tcp_bic.conf
+# blacklist must end .conf to load
+echo "blacklist tcp_bbr" > /etc/modprobe.d/blacklist-tcp-bbr.conf
+echo "tcp_bbr3" > /etc/modules-load.d/bbr3.conf
 
 # Set up zsh for the user
 print_step "Setting up user environment..."
