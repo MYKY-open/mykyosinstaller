@@ -198,8 +198,20 @@ format_all() {
                 mkfs.f2fs -f -O "$F2FS_FORMAT_FEATURES" "$dev"
                 ;;
             vfat)
-                print_step "Formatting $dev ($mnt) as FAT32..."
-                mkfs.fat -F32 "$dev"
+                # ESP: FAT16 is the sane choice for typical small boot
+                # partitions (less FAT overhead, trouble-free firmware).
+                # FAT16 tops out around 2G - bigger ESPs fall back to FAT32.
+                fat_bits=16
+                if size_bytes=$(blockdev --getsize64 "$dev" 2>/dev/null); then
+                    (( size_bytes > 2147483648 )) && fat_bits=32
+                fi
+                print_step "Formatting $dev ($mnt) as FAT$fat_bits..."
+                if [[ $fat_bits == 16 ]]; then
+                    mkfs.fat -F16 -n ESP "$dev"
+                else
+                    echo "Note: $dev is larger than 2G, FAT16 cannot hold it - using FAT32."
+                    mkfs.fat -F32 -n ESP "$dev"
+                fi
                 ;;
             swap)
                 print_step "Setting up swap on $dev..."

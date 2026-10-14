@@ -185,6 +185,8 @@ planner_summary() {
     local spec dev mnt fs fmt out=""
     for spec in "${MOUNTS[@]}"; do
         IFS='|' read -r dev mnt fs fmt enc <<<"$spec"
+        # /boot is always FAT16 ESP - show it plainly
+        [[ "$mnt" == "/boot" ]] && fs="FAT16 (ESP)"
         local tags="$fs, $( [[ $fmt == yes ]] && echo FORMAT || echo keep )"
         [[ $enc == "yes" ]] && tags+=", LUKS"
         if [[ $fs == "inherit" ]]; then
@@ -302,24 +304,23 @@ add_assignment() {
         fi
     fi
 
-    # Filesystem (swap is fixed, bind entries inherit from the primary)
+    # Filesystem (swap is fixed, bind entries inherit from the primary,
+    # /boot is always FAT16 ESP - no choice, it is the only sane option)
     local fs=""
     if [[ "$is_bind" == "yes" ]]; then
         fs="inherit"
+    elif [[ "$mnt" == "/boot" ]]; then
+        fs="vfat"   # ESP, always FAT16 (see format_all)
+        ui_msg "Disk planner" "$dev will be used as EFI System Partition.\n\nFilesystem is fixed to FAT16 and it will always be formatted - no choice needed."
     elif [[ "$mnt" != "swap" ]]; then
         if ! ui_menu "Disk planner" "Filesystem for $dev ($mnt):" \
             "ext4" "the universal, recommended" \
             "btrfs" "terminator, cant kill" \
-            "f2fs" "flash memory optimized, recommended" \
-            "vfat" "FAT32 (for EFI system partitions)"
+            "f2fs" "flash memory optimized, recommended"
         then
             return
         fi
         fs="$MENU_RESULT"
-        if [[ "$mnt" == "/" && "$fs" == "vfat" ]]; then
-            ui_msg "Disk planner" "Root cannot be vfat."
-            return
-        fi
     fi
 
     # Encryption? (per partition; swap and binds excluded, ESP impossible)
@@ -330,10 +331,13 @@ add_assignment() {
         fi
     fi
 
-    # Format?
+    # Format? (/boot ESP and swap are always formatted - no point asking.
+    # LUKS implies format. Everything else asks.)
     local fmt="no"
     if [[ "$is_bind" == "yes" ]]; then
         fmt="inherit"
+    elif [[ "$mnt" == "/boot" || "$mnt" == "swap" ]]; then
+        fmt="yes"
     elif [[ "$enc" == "yes" ]]; then
         fmt="yes"   # LUKS container must be created fresh, implies format
     elif ui_yesno_safe "Disk planner" "Format $dev as ${fs:-swap}?\n\nWARNING: ALL DATA on $dev will be DESTROYED."; then
@@ -360,6 +364,15 @@ validate_plan() {
         ui_msg "Disk planner" "You must assign exactly ONE root (/) partition.\nCurrently assigned: $roots"
         return 1
     fi
+    # /boot must be a FAT ESP (planner forces this for new assignments;
+    # this catches stale plans from older installer versions)
+    for spec in "${MOUNTS[@]}"; do
+        IFS='|' read -r dev mnt fs _ _ <<<"$spec"
+        if [[ "$mnt" == "/boot" && "$fs" != "vfat" ]]; then
+            ui_msg "Disk planner" "/boot on $dev is '$fs' - it must be FAT (ESP).\nRemove it and re-add $dev as /boot."
+            return 1
+        fi
+    done
     # Bind entries need their primary to still exist
     for spec in "${MOUNTS[@]}"; do
         IFS='|' read -r dev mnt fs _ _ <<<"$spec"
@@ -550,27 +563,51 @@ username="$INPUT_RESULT"
 ask_password "User password" user_password
 ask_password "Root password" root_password
 
-# Pacman configuration
-ui_menu "Pacman" "Which pacman configuration would you like to use?" \
-    "1" "Local config" \
-    "2" "Local cache" \
-    "3" "Local cache and config" \
-    "4" "vanilla.conf" \
-    "5" "cachyV2.conf" \
-    "6" "cachyV3.conf" \
-    "7" "cachyV4.conf" \
+# x86-64 microarch level of THIS machine (for CachyOS V2/V3/V4 repos).
+# v4 needs AVX512, v3 needs AVX2/BMI/FMA, v2 needs SSE4.2/SSSE3/POPCNT.
+detect_uarch() {
+    local flags
+    flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null) || { echo "v1"; return; }
+    local f=" $flags "
+    has() { [[ "$f" == *" $1 "* ]]; }
+    if has avx512f && has avx512bw && has avx512cd && has avx512dq && has avx512vl; then echo v4
+    elif has avx && has avx2 && has bmi1 && has bmi2 && has fma; then echo v3
+    elif has sse4_2 && has ssse3 && has popcnt; then echo v2
+    else echo v1; fi
+}
+uarch_rank() { case "$1" in v4) echo 4;; v3) echo 3;; v2) echo 2;; *) echo 1;; esac; }
+
+# Pacman configuration (CachyOS-optimized repos only;
+# vanilla/local options masked for now - uncomment to bring back)
+HOST_UARCH=$(detect_uarch)
+HOST_RANK=$(uarch_rank "$HOST_UARCH")
+tag_for() { # tag_for v3 -> "THIS PC - best" / "OK for this PC" / "TOO NEW for this PC"
+    local want="$1" wr
+    wr=$(uarch_rank "$want")
+    if [[ "$HOST_UARCH" == "$want" ]]; then echo "THIS PC - best match"
+    elif (( HOST_RANK > wr )); then echo "works on this PC (older than its max)"
+    else echo "TOO NEW - this PC only does $HOST_UARCH"; fi
+}
+ui_menu "Pacman" "This machine supports up to x86-64-$HOST_UARCH. Pick repo:" \
+    "V2" "x86-64-v2 - $(tag_for v2)" \
+    "V3" "x86-64-v3 - $(tag_for v3)" \
+    "V4" "x86-64-v4 - $(tag_for v4)" \
     || die "Installation cancelled."
 pacman_config_choice="$MENU_RESULT"
 case $pacman_config_choice in
-  1) pacman_config="-P" ;;
-  2) pacman_config="-c" ;;
-  3) pacman_config="-P -c" ;;
-  4) pacman_config="-C ./pacmanconf/vanilla.conf" ;;
-  5) pacman_config="-C ./pacmanconf/cachyV2.conf" ;;
-  6) pacman_config="-C ./pacmanconf/cachyV3.conf" ;;
-  7) pacman_config="-C ./pacmanconf/cachyV4.conf" ;;
+  V2|5) pacman_config="-C ./pacmanconf/cachyV2.conf" ;;
+  V3|6) pacman_config="-C ./pacmanconf/cachyV3.conf" ;;
+  V4|7) pacman_config="-C ./pacmanconf/cachyV4.conf" ;;
+  # masked for now: vanilla / local live-env options
+  #1) pacman_config="-P" ;;
+  #2) pacman_config="-c" ;;
+  #3) pacman_config="-P -c" ;;
+  #4) pacman_config="-C ./pacmanconf/vanilla.conf" ;;
   *) pacman_config="" ;;
 esac
+if [[ "$pacman_config_choice" == V* ]] && (( HOST_RANK < $(uarch_rank "v${pacman_config_choice#V}") )); then
+    ui_yesno "Pacman" "WARNING: x86-64-v${pacman_config_choice#V} repo needs newer CPU than this PC ($HOST_UARCH).\nPackages may crash with illegal instruction.\n\nUse it anyway?" || die "Installation cancelled."
+fi
 
 # Kernel
 ui_menu "Kernel" "Choose a kernel:" \
@@ -601,6 +638,14 @@ if [[ "$INSTALL_MODE" == "partitions" ]]; then
         "grub-bios" "GRUB BIOS (multi-OS)" \
         || die "Installation cancelled."
     bootloader="$MENU_RESULT"
+    # EFI bootloaders need a /boot ESP; BIOS does not.
+    if [[ "$bootloader" != "grub-bios" ]]; then
+        has_boot=""
+        for spec in "${MOUNTS[@]}"; do
+            [[ $(cut -d'|' -f2 <<<"$spec") == "/boot" ]] && has_boot="yes"
+        done
+        [[ -z "$has_boot" ]] && die "No /boot partition assigned - EFI bootloader '$bootloader' has nowhere to live. Re-run and add an ESP as /boot."
+    fi
 
     if [[ "$bootloader" == "grub" || "$bootloader" == "grub32bitefi" ]]; then
         ui_menu "GRUB" "Installation mode:" \
