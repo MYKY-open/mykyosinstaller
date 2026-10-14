@@ -311,7 +311,7 @@ add_assignment() {
         fs="inherit"
     elif [[ "$mnt" == "/boot" ]]; then
         fs="vfat"   # ESP, always FAT16 (see format_all)
-        ui_msg "Disk planner" "$dev will be used as EFI System Partition.\n\nFilesystem is fixed to FAT16 and it will always be formatted - no choice needed."
+        ui_msg "Disk planner" "$dev will be used as EFI System Partition.\n\nFilesystem is fixed to FAT16 - no choice needed.\nYou will be asked next whether to format it or keep it."
     elif [[ "$mnt" != "swap" ]]; then
         if ! ui_menu "Disk planner" "Filesystem for $dev ($mnt):" \
             "ext4" "the universal, recommended" \
@@ -331,13 +331,26 @@ add_assignment() {
         fi
     fi
 
-    # Format? (/boot ESP and swap are always formatted - no point asking.
-    # LUKS implies format. Everything else asks.)
+    # Format? (swap is always initialized, LUKS implies format.
+    # /boot ESP asks: format = clean fresh FAT16, keep = shared ESP
+    # with Windows/another OS. Everything else asks.)
     local fmt="no"
     if [[ "$is_bind" == "yes" ]]; then
         fmt="inherit"
-    elif [[ "$mnt" == "/boot" || "$mnt" == "swap" ]]; then
+    elif [[ "$mnt" == "swap" ]]; then
         fmt="yes"
+    elif [[ "$mnt" == "/boot" ]]; then
+        if ui_yesno_safe "Disk planner" "Format $dev as FAT16 ESP?\n\nYes = fresh clean ESP (new installs).\nNo = KEEP existing files (REQUIRED when sharing this ESP\nwith Windows or another OS)."; then
+            fmt="yes"
+        else
+            # Keeping: what is there must actually be FAT, else mount fails later
+            local curtype
+            curtype=$(blkid -s TYPE -o value "$dev" 2>/dev/null)
+            if [[ -n "$curtype" && "$curtype" != vfat && "$curtype" != msdos ]]; then
+                ui_msg "Disk planner" "$dev is '$curtype', not FAT - cannot be an ESP without formatting.\nPick another partition or say Yes to format."
+                return
+            fi
+        fi
     elif [[ "$enc" == "yes" ]]; then
         fmt="yes"   # LUKS container must be created fresh, implies format
     elif ui_yesno_safe "Disk planner" "Format $dev as ${fs:-swap}?\n\nWARNING: ALL DATA on $dev will be DESTROYED."; then
